@@ -16,7 +16,7 @@ const http  = require("http");
 const TARGETS = {
   iiko:        "https://api-{region}.iiko.services",
   yandex:      "https://b2b.taxi.yandex.net/api/v1/eats-restapi",
-  yandex_auth: "https://iam.taxi.yandex.net",
+  yandex_auth: "https://b2b.taxi.yandex.net/api/v1/eats-restapi",
 };
 
 function uid() {
