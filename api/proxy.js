@@ -1,8 +1,10 @@
 /**
  * Vercel Serverless Proxy (Node.js)
- * Поддерживает:
- *   - iiko Cloud API  → ?region=ru&path=api/1/access_token
- *   - Yandex Eda API  → ?target=yandex&path=security/oauth/token
+ *
+ * Targets:
+ *   ?target=iiko        → https://api-ru.iiko.services  (iiko Cloud API)
+ *   ?target=yandex      → https://b2b.taxi.yandex.net/api/v1/eats-restapi  (Yandex Eda API)
+ *   ?target=yandex_auth → https://iam.taxi.yandex.net  (Yandex OAuth token)
  *
  * URL в консоли (поле VC):
  *   https://yandex-proxy-seven.vercel.app/api/proxy
@@ -11,14 +13,11 @@
 const https = require("https");
 const http  = require("http");
 
-const IIKO_BASES = {
-  ru:   "https://api-ru.iiko.services",
-  us:   "https://api-us.iiko.services",
-  eu:   "https://api-eu.iiko.services",
-  test: "https://api-test.iiko.services",
+const TARGETS = {
+  iiko:        "https://api-{region}.iiko.services",
+  yandex:      "https://b2b.taxi.yandex.net/api/v1/eats-restapi",
+  yandex_auth: "https://iam.taxi.yandex.net",
 };
-
-const YANDEX_BASE = "https://b2b.taxi.yandex.net/api/v1/eats-restapi";
 
 function uid() {
   return Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
@@ -67,7 +66,6 @@ function doRequest(targetUrl, method, headers, body, timeoutMs) {
 
     req.setTimeout(timeoutMs, () => { req.destroy(); reject(new Error("upstream_timeout")); });
     req.on("error", reject);
-
     if (body) req.write(body);
     req.end();
   });
@@ -93,14 +91,18 @@ module.exports = async function handler(req, res) {
     return res.status(400).end(JSON.stringify({ error: "Missing 'path' query parameter" }));
   }
 
-  let targetUrl;
-  if (target === "yandex") {
-    targetUrl = `${YANDEX_BASE}/${path}`;
-  } else {
-    const base = IIKO_BASES[region] || IIKO_BASES.ru;
-    targetUrl  = `${base}/${path}`;
+  let base = TARGETS[target];
+  if (!base) {
+    res.setHeader("Content-Type", "application/json");
+    return res.status(400).end(JSON.stringify({ error: `Unknown target: ${target}` }));
   }
 
+  // iiko поддерживает регионы
+  base = base.replace("{region}", region);
+
+  const targetUrl = `${base}/${path}`;
+
+  // Собираем upstream-заголовки
   const upHeaders = {};
   const auth = req.headers["authorization"];
   if (auth) upHeaders["Authorization"] = auth;
