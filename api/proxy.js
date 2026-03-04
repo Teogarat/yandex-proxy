@@ -2,9 +2,9 @@
  * Vercel Serverless Proxy (Node.js)
  *
  * Targets:
- *   ?target=iiko        → https://api-ru.iiko.services  (iiko Cloud API)
- *   ?target=yandex      → https://b2b.taxi.yandex.net/api/v1/eats-restapi  (Yandex Eda API)
- *   ?target=yandex_auth → https://iam.taxi.yandex.net  (Yandex OAuth token)
+ *   ?target=iiko        → https://api-{region}.iiko.services
+ *   ?target=yandex      → https://b2b.taxi.yandex.net/api/v1/eats-restapi
+ *   ?target=yandex_auth → https://iam.taxi.yandex.net/v1  (Yandex OAuth)
  *
  * URL в консоли (поле VC):
  *   https://yandex-proxy-seven.vercel.app/api/proxy
@@ -16,7 +16,7 @@ const http  = require("http");
 const TARGETS = {
   iiko:        "https://api-{region}.iiko.services",
   yandex:      "https://b2b.taxi.yandex.net/api/v1/eats-restapi",
-  yandex_auth: "https://b2b.taxi.yandex.net/api/v1/eats-restapi",
+  yandex_auth: "https://iam.taxi.yandex.net/v1",
 };
 
 function uid() {
@@ -27,7 +27,7 @@ function corsHeaders() {
   return {
     "Access-Control-Allow-Origin":  "*",
     "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization, Timeout",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization, Timeout, Accept",
     "Access-Control-Expose-Headers":"x-proxy-request-id",
   };
 }
@@ -97,15 +97,18 @@ module.exports = async function handler(req, res) {
     return res.status(400).end(JSON.stringify({ error: `Unknown target: ${target}` }));
   }
 
-  // iiko поддерживает регионы
   base = base.replace("{region}", region);
-
   const targetUrl = `${base}/${path}`;
 
-  // Собираем upstream-заголовки
+  // Логируем куда идёт запрос (видно в Vercel Function Logs)
+  console.log(`[proxy] ${req.method} target=${target} url=${targetUrl}`);
+
   const upHeaders = {};
   const auth = req.headers["authorization"];
   if (auth) upHeaders["Authorization"] = auth;
+
+  const accept = req.headers["accept"];
+  if (accept) upHeaders["Accept"] = accept;
 
   const timeoutSec = Math.max(1, Math.min(120, parseInt(req.headers["timeout"] || "15", 10)));
 
