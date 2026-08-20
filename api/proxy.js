@@ -2,13 +2,18 @@
  * Vercel Serverless Proxy (Node.js)
  *
  * Targets:
- *   ?target=iiko        → https://api-{region}.iiko.services  (iiko Cloud API)
- *   ?target=yandex      → {webhookUrl}/...  (Yandex Eda — твой iiko-сервер)
+ *   ?target=iiko        → https://api-{region}.iiko.services
+ *   ?target=yandex      → {X-Yandex-Host}/{path}
+ *   ?target=magnit      → {X-Magnit-Host}/{path}
  *
- * Для Yandex передавай хост через заголовок X-Yandex-Host:
- *   X-Yandex-Host: https://ip-hozhiev-a-a.iikoweb.ru/api/integrations/yandex-food
+ * Headers:
+ *   Yandex:
+ *   X-Yandex-Host: https://xxx.iikoweb.ru/api/integrations/yandex-food
  *
- * URL в консоли (поле VC):
+ *   Magnit:
+ *   X-Magnit-Host: https://xxx.iikoweb.ru/api/integrations/magnit
+ *
+ * Proxy URL:
  *   https://yandex-proxy-seven.vercel.app/api/proxy
  */
 
@@ -22,147 +27,699 @@ const IIKO_BASES = {
   test: "https://api-test.iiko.services",
 };
 
+// Не переиспользуем upstream-сокеты.
+// Для тяжёлого ответа меню Magnit так надёжнее.
+const HTTPS_AGENT = new https.Agent({ keepAlive: false });
+const HTTP_AGENT = new http.Agent({ keepAlive: false });
+
 function uid() {
-  return Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+  return (
+    Math.random().toString(36).slice(2, 10) +
+    Date.now().toString(36)
+  );
 }
 
 function corsHeaders() {
   return {
     "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization, Timeout, Accept, X-Yandex-Host",
-    "Access-Control-Expose-Headers": "x-proxy-request-id",
+
+    "Access-Control-Allow-Methods":
+      "GET, POST, PUT, DELETE, OPTIONS",
+
+    "Access-Control-Allow-Headers":
+      "Content-Type, Authorization, Timeout, Accept, X-Yandex-Host, X-Magnit-Host",
+
+    "Access-Control-Expose-Headers":
+      "x-proxy-request-id, x-proxy-target, x-upstream-time-ms",
   };
 }
 
 function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
-    req.on("data", c => chunks.push(c));
-    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+
+    req.on("data", chunk => chunks.push(chunk));
+
+    req.on("end", () => {
+      resolve(
+        Buffer.concat(chunks).toString("utf8")
+      );
+    });
+
     req.on("error", reject);
   });
 }
 
-function doRequest(targetUrl, method, headers, body, timeoutMs) {
+function normalizeBaseUrl(raw, kind) {
+  const value = String(raw || "")
+    .trim()
+    .replace(/\/+$/, "");
+
+  if (!value) {
+    throw new Error(`Missing ${kind} host`);
+  }
+
+  let parsed;
+
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error(`Invalid ${kind} host URL`);
+  }
+
+  if (parsed.protocol !== "https:") {
+    throw new Error(`${kind} host must use https`);
+  }
+
+  if (parsed.username || parsed.password) {
+    throw new Error(
+      `${kind} host must not contain credentials`
+    );
+  }
+
+  return parsed.toString().replace(/\/+$/, "");
+}
+
+function validateMagnitHost(raw) {
+  const base = normalizeBaseUrl(raw, "Magnit");
+  const url = new URL(base);
+
+  // Чтобы прокси не превратился в универсальную дырку.
+  // Magnit разрешаем только внутри iikoweb.ru.
+  if (
+    !(
+      url.hostname === "iikoweb.ru" ||
+      url.hostname.endsWith(".iikoweb.ru")
+    )
+  ) {
+    throw new Error(
+      "Magnit host must be inside *.iikoweb.ru"
+    );
+  }
+
+  const pathname = url.pathname.replace(/\/+$/, "");
+
+  if (
+    !/\/api\/integrations\/magnit$/i.test(pathname)
+  ) {
+    throw new Error(
+      "Magnit host must end with /api/integrations/magnit"
+    );
+  }
+
+  return base;
+}
+
+function doRequest(
+  targetUrl,
+  method,
+  headers,
+  body,
+  timeoutMs
+) {
   return new Promise((resolve, reject) => {
     const parsed = new URL(targetUrl);
-    const lib = parsed.protocol === "https:" ? https : http;
+
+    const isHttps =
+      parsed.protocol === "https:";
+
+    const lib =
+      isHttps ? https : http;
 
     const options = {
       hostname: parsed.hostname,
-      port: parsed.port || (parsed.protocol === "https:" ? 443 : 80),
-      path: parsed.pathname + parsed.search,
+
+      port:
+        parsed.port ||
+        (isHttps ? 443 : 80),
+
+      path:
+        parsed.pathname +
+        parsed.search,
+
       method,
       headers,
+
+      agent:
+        isHttps
+          ? HTTPS_AGENT
+          : HTTP_AGENT,
     };
 
-    const req = lib.request(options, res => {
-      const chunks = [];
-      res.on("data", c => chunks.push(c));
-      res.on("end", () => {
-        resolve({
-          status: res.statusCode,
-          headers: res.headers,
-          body: Buffer.concat(chunks).toString("utf8"),
-        });
-      });
-    });
+    const started = Date.now();
 
-    req.setTimeout(timeoutMs, () => {
-      req.destroy();
-      reject(new Error("upstream_timeout"));
-    });
+    const upstreamReq =
+      lib.request(
+        options,
+        upstreamRes => {
+          const chunks = [];
 
-    req.on("error", reject);
+          upstreamRes.on(
+            "data",
+            chunk => chunks.push(chunk)
+          );
 
-    if (body !== null && body !== undefined) {
-      req.write(body);
+          upstreamRes.on(
+            "end",
+            () => {
+              resolve({
+                status:
+                  upstreamRes.statusCode,
+
+                headers:
+                  upstreamRes.headers,
+
+                body:
+                  Buffer.concat(
+                    chunks
+                  ).toString("utf8"),
+
+                elapsedMs:
+                  Date.now() - started,
+              });
+            }
+          );
+        }
+      );
+
+    upstreamReq.setTimeout(
+      timeoutMs,
+      () => {
+        const err =
+          new Error(
+            "upstream_timeout"
+          );
+
+        err.code =
+          "UPSTREAM_TIMEOUT";
+
+        upstreamReq.destroy(err);
+      }
+    );
+
+    upstreamReq.on(
+      "error",
+      reject
+    );
+
+    if (
+      body !== null &&
+      body !== undefined
+    ) {
+      upstreamReq.write(body);
     }
 
-    req.end();
+    upstreamReq.end();
   });
 }
 
-module.exports = async function handler(req, res) {
+function isTransientReadError(err) {
+  const code =
+    String(
+      err?.code || ""
+    ).toUpperCase();
+
+  const message =
+    String(
+      err?.message || ""
+    ).toUpperCase();
+
+  return (
+    [
+      "ETIMEDOUT",
+      "ECONNRESET",
+      "EPIPE",
+      "EAI_AGAIN",
+    ].includes(code) ||
+
+    message.includes(
+      "ETIMEDOUT"
+    ) ||
+
+    message.includes(
+      "ECONNRESET"
+    )
+  );
+}
+
+async function doRequestWithSafeRetry(
+  targetUrl,
+  method,
+  headers,
+  body,
+  timeoutMs
+) {
+  try {
+    return await doRequest(
+      targetUrl,
+      method,
+      headers,
+      body,
+      timeoutMs
+    );
+  } catch (err) {
+
+    /*
+     * ВАЖНО:
+     * повторяем только GET / HEAD.
+     *
+     * POST / PUT / DELETE
+     * никогда автоматически
+     * не повторяем,
+     * чтобы не создать
+     * два заказа.
+     */
+    if (
+      !["GET", "HEAD"].includes(method) ||
+      !isTransientReadError(err)
+    ) {
+      throw err;
+    }
+
+    console.warn(
+      `[proxy] transient ${
+        err.code || err.message
+      }; retrying ${method} once`
+    );
+
+    await new Promise(
+      resolve =>
+        setTimeout(resolve, 250)
+    );
+
+    return await doRequest(
+      targetUrl,
+      method,
+      headers,
+      body,
+      timeoutMs
+    );
+  }
+}
+
+module.exports =
+async function handler(req, res) {
   const rid = uid();
 
-  Object.entries(corsHeaders()).forEach(([k, v]) => res.setHeader(k, v));
-  res.setHeader("x-proxy-request-id", rid);
+  Object.entries(
+    corsHeaders()
+  ).forEach(([key, value]) => {
+    res.setHeader(key, value);
+  });
+
+  res.setHeader(
+    "x-proxy-request-id",
+    rid
+  );
 
   if (req.method === "OPTIONS") {
-    return res.status(204).end();
+    return res
+      .status(204)
+      .end();
   }
 
-  const url = new URL(req.url, `https://${req.headers.host}`);
-  const target = url.searchParams.get("target") || "iiko";
-  const path = (url.searchParams.get("path") || "").replace(/^\/+/, "");
-  const region = url.searchParams.get("region") || "ru";
+  const url =
+    new URL(
+      req.url,
+      `https://${req.headers.host}`
+    );
+
+  const target =
+    String(
+      url.searchParams.get(
+        "target"
+      ) || "iiko"
+    ).toLowerCase();
+
+  const path =
+    (
+      url.searchParams.get(
+        "path"
+      ) || ""
+    ).replace(/^\/+/, "");
+
+  const region =
+    url.searchParams.get(
+      "region"
+    ) || "ru";
+
+  res.setHeader(
+    "x-proxy-target",
+    target
+  );
 
   if (!path) {
-    res.setHeader("Content-Type", "application/json");
-    return res.status(400).end(JSON.stringify({ error: "Missing 'path' query parameter" }));
+    res.setHeader(
+      "Content-Type",
+      "application/json"
+    );
+
+    return res
+      .status(400)
+      .end(
+        JSON.stringify({
+          error:
+            "Missing 'path' query parameter",
+        })
+      );
   }
 
   let targetUrl;
 
-  if (target === "yandex") {
-    const yandexHost = (req.headers["x-yandex-host"] || "").trim().replace(/\/+$/, "");
+  try {
 
-    if (!yandexHost) {
-      res.setHeader("Content-Type", "application/json");
-      return res.status(400).end(JSON.stringify({ error: "Missing X-Yandex-Host header" }));
+    // ==========================
+    // YANDEX
+    // ==========================
+
+    if (target === "yandex") {
+
+      const yandexHost =
+        normalizeBaseUrl(
+          req.headers[
+            "x-yandex-host"
+          ],
+          "Yandex"
+        );
+
+      targetUrl =
+        `${yandexHost}/${path}`;
     }
 
-    targetUrl = `${yandexHost}/${path}`;
-  } else {
-    const base = IIKO_BASES[region] || IIKO_BASES.ru;
-    targetUrl = `${base}/${path}`;
+    // ==========================
+    // MAGNIT
+    // ==========================
+
+    else if (
+      target === "magnit"
+    ) {
+
+      const magnitHost =
+        validateMagnitHost(
+          req.headers[
+            "x-magnit-host"
+          ]
+        );
+
+      targetUrl =
+        `${magnitHost}/${path}`;
+    }
+
+    // ==========================
+    // IIKO CLOUD
+    // ==========================
+
+    else if (
+      target === "iiko"
+    ) {
+
+      const base =
+        IIKO_BASES[region] ||
+        IIKO_BASES.ru;
+
+      targetUrl =
+        `${base}/${path}`;
+    }
+
+    // ==========================
+    // UNKNOWN
+    // ==========================
+
+    else {
+
+      res.setHeader(
+        "Content-Type",
+        "application/json"
+      );
+
+      return res
+        .status(400)
+        .end(
+          JSON.stringify({
+            error:
+              `Unknown target '${target}'`,
+          })
+        );
+    }
+
+  } catch (e) {
+
+    res.setHeader(
+      "Content-Type",
+      "application/json"
+    );
+
+    return res
+      .status(400)
+      .end(
+        JSON.stringify({
+          error:
+            String(
+              e.message || e
+            ),
+        })
+      );
   }
 
-  console.log(`[proxy] ${req.method} target=${target} → ${targetUrl}`);
+  console.log(
+    `[proxy] rid=${rid} ` +
+    `${req.method} ` +
+    `target=${target} ` +
+    `→ ${targetUrl}`
+  );
 
-  const upHeaders = {};
+  // ==========================
+  // UPSTREAM HEADERS
+  // ==========================
 
-  const auth = req.headers["authorization"];
-  if (auth) upHeaders["Authorization"] = auth;
+  const upHeaders = {
+    "User-Agent":
+      "IIKO-API-Console-Proxy/1.0",
+  };
 
-  const accept = req.headers["accept"];
-  if (accept) upHeaders["Accept"] = accept;
+  const auth =
+    req.headers[
+      "authorization"
+    ];
 
-  const timeoutSec = Math.max(1, Math.min(120, parseInt(req.headers["timeout"] || "15", 10)));
+  if (auth) {
+    upHeaders[
+      "Authorization"
+    ] = auth;
+  }
 
-  const rawBody = req.method !== "GET" && req.method !== "HEAD"
-    ? await readBody(req)
-    : null;
+  const accept =
+    req.headers[
+      "accept"
+    ];
 
-  const contentType = req.headers["content-type"] || "application/json";
+  if (accept) {
+    upHeaders[
+      "Accept"
+    ] = accept;
+  }
+
+  // ==========================
+  // TIMEOUT
+  // ==========================
+
+  /*
+   * Для Magnit
+   * по умолчанию 60 секунд.
+   *
+   * Для iiko / Yandex
+   * оставляем 15.
+   */
+
+  const parsedTimeout =
+    parseInt(
+      req.headers[
+        "timeout"
+      ] ||
+      (
+        target === "magnit"
+          ? "60"
+          : "15"
+      ),
+      10
+    );
+
+  const timeoutSec =
+    Math.max(
+      1,
+      Math.min(
+        120,
+
+        Number.isFinite(
+          parsedTimeout
+        )
+          ? parsedTimeout
+          : 15
+      )
+    );
+
+  // ==========================
+  // BODY
+  // ==========================
+
+  let rawBody = null;
+
+  try {
+
+    rawBody =
+      req.method !== "GET" &&
+      req.method !== "HEAD"
+
+        ? await readBody(req)
+
+        : null;
+
+  } catch (e) {
+
+    res.setHeader(
+      "Content-Type",
+      "application/json"
+    );
+
+    return res
+      .status(400)
+      .end(
+        JSON.stringify({
+          error:
+            `Cannot read request body: ${String(e)}`,
+        })
+      );
+  }
+
+  const contentType =
+    req.headers[
+      "content-type"
+    ] ||
+    "application/json";
 
   if (rawBody !== null) {
-    upHeaders["Content-Type"] = contentType;
-    upHeaders["Content-Length"] = Buffer.byteLength(rawBody, "utf8");
+
+    upHeaders[
+      "Content-Type"
+    ] = contentType;
+
+    upHeaders[
+      "Content-Length"
+    ] =
+      Buffer.byteLength(
+        rawBody,
+        "utf8"
+      );
   }
 
-  if (target === "yandex" && req.method === "DELETE") {
-    console.log(`[proxy] DELETE body length=${rawBody === null ? 0 : Buffer.byteLength(rawBody, "utf8")}`);
-    console.log(`[proxy] DELETE body=${rawBody || ""}`);
-    console.log(`[proxy] upstream headers=${JSON.stringify(upHeaders)}`);
-  }
+  // ==========================
+  // SEND REQUEST
+  // ==========================
 
   let upResp;
 
   try {
-    upResp = await doRequest(targetUrl, req.method, upHeaders, rawBody, timeoutSec * 1000);
+
+    upResp =
+      await doRequestWithSafeRetry(
+        targetUrl,
+
+        String(
+          req.method || "GET"
+        ).toUpperCase(),
+
+        upHeaders,
+
+        rawBody,
+
+        timeoutSec * 1000
+      );
+
   } catch (e) {
-    const isTimeout = e.message === "upstream_timeout";
-    res.setHeader("Content-Type", "application/json");
+
+    const isTimeout =
+      e?.message ===
+        "upstream_timeout" ||
+
+      e?.code ===
+        "UPSTREAM_TIMEOUT";
+
+    const errorCode =
+      e?.code || null;
+
+    console.error(
+      `[proxy] rid=${rid} ` +
+      `failed ` +
+      `target=${target} ` +
+      `code=${errorCode || "-"} ` +
+      `error=${String(e)}`
+    );
+
+    res.setHeader(
+      "Content-Type",
+      "application/json"
+    );
+
     return res
-      .status(isTimeout ? 504 : 502)
-      .end(JSON.stringify({ error: isTimeout ? `Timeout after ${timeoutSec}s` : String(e) }));
+      .status(
+        isTimeout
+          ? 504
+          : 502
+      )
+      .end(
+        JSON.stringify({
+          error:
+            isTimeout
+              ? `Timeout after ${timeoutSec}s`
+              : String(e),
+
+          code:
+            errorCode,
+
+          target,
+
+          rid,
+        })
+      );
   }
 
-  const respCt = upResp.headers["content-type"] || "application/json";
-  res.setHeader("Content-Type", respCt);
+  // ==========================
+  // RESPONSE
+  // ==========================
 
-  return res.status(upResp.status).end(upResp.body);
+  res.setHeader(
+    "x-upstream-time-ms",
+    String(
+      upResp.elapsedMs
+    )
+  );
+
+  const respCt =
+    upResp.headers[
+      "content-type"
+    ] ||
+    "application/json";
+
+  res.setHeader(
+    "Content-Type",
+    respCt
+  );
+
+  console.log(
+    `[proxy] rid=${rid} ` +
+    `upstream=${upResp.status} ` +
+    `${upResp.elapsedMs}ms ` +
+    `bytes=${Buffer.byteLength(
+      upResp.body,
+      "utf8"
+    )}`
+  );
+
+  return res
+    .status(
+      upResp.status
+    )
+    .end(
+      upResp.body
+    );
 };
